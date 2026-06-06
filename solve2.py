@@ -2,54 +2,106 @@ import numpy as np
 import pandas as pd
 from scipy.interpolate import interp1d
 from scipy.optimize import minimize
-from scipy.stats import ttest_1samp  # 引入第一处升级：单样本t检验
-from pulp import * # 引入第三处升级：整数线性规划
+from scipy.stats import ttest_1samp
+from pulp import *
 
 # =========================================================================
-# 工具函数：计算两角度在 [-180, 180] 范围内的最小夹角差
+# 全局配置
+# =========================================================================
+DATA_DIR = '/home/lsp/Mathematical_schrace/data/'
+PHOTO_ANGLE_MIN_DIFF = 60.0  # 拍照角度差异阈值（度）
+
+# =========================================================================
+# 工具函数
 # =========================================================================
 def calculate_angle_diff(a1, a2):
+    """计算两角度在 [-180, 180] 范围内的最小夹角差"""
     diff = np.abs(a1 - a2) % 360
     return np.where(diff > 180, 360 - diff, diff)
 
-# =========================================================================
-# 升级处一：问题3系统偏差显著性检验（单样本双尾 t 检验）
-# =========================================================================
-def bias_significance_test(df1, df2, dt, dx, dy):
-    """
-    对对齐时间后的空间残差进行统计学单样本 t 检验。
-    【修正点】：必须使用未进行空间修正的原始坐标，去检验残差均值是否显著不为 0！
-    """
-    t1 = df1.iloc[:, 0].values
-    x1 = df1.iloc[:, 1].values
-    y1 = df1.iloc[:, 2].values
-    
-    t2 = df2.iloc[:, 0].values + dt
-    # 【核心修改】：移除提前加 dx, dy 的操作，保持原始位置
-    x2_raw = df2.iloc[:, 1].values 
-    y2_raw = df2.iloc[:, 2].values
-    
-    fx = interp1d(t2, x2_raw, fill_value='extrapolate', kind='linear')
-    fy = interp1d(t2, y2_raw, fill_value='extrapolate', kind='linear')
-    
-    mask = (t1 >= t2.min()) & (t1 <= t2.max())
-    
-    dx_residual = x1[mask] - fx(t1[mask])
-    dy_residual = y1[mask] - fy(t1[mask])
-    
-    # 检验原始残差是否显著不等于 0
-    px = ttest_1samp(dx_residual, 0).pvalue
-    py = ttest_1samp(dy_residual, 0).pvalue
-    
-    return px, py
+def estimate_initial_dt(df1, df2):
+    """智能估计初始时间偏差：用两个传感器时间范围中点的差值"""
+    t1_mid = (df1.iloc[:, 0].min() + df1.iloc[:, 0].max()) / 2
+    t2_mid = (df2.iloc[:, 0].min() + df2.iloc[:, 0].max()) / 2
+    return t1_mid - t2_mid
 
 # =========================================================================
-# 升级处二：基于空间残差统计特征的自适应观测噪声协方差 R 矩阵估计
+# 问题1：纯时间对齐（三次样条插值 + 简单平均融合）
+# =========================================================================
+def solve_problem_1(df1, df2):
+    t1, x1, y1 = df1.iloc[:, 0].values, df1.iloc[:, 1].values, df1.iloc[:, 2].values
+    t2, x2, y2 = df2.iloc[:, 0].values, df2.iloc[:, 1].values, df2.iloc[:, 2].values
+
+    f_x2 = interp1d(t2, x2, kind='cubic', fill_value='extrapolate')
+    f_y2 = interp1d(t2, y2, kind='cubic', fill_value='extrapolate')
+
+    dt_init = estimate_initial_dt(df1, df2)
+
+    def objective(dt):
+        t2_proj = t1 - dt
+        mask = (t2_proj >= t2.min()) & (t2_proj <= t2.max())
+        if not np.any(mask):
+            return 1e9
+        return np.mean((x1[mask] - f_x2(t2_proj[mask]))**2 +
+                       (y1[mask] - f_y2(t2_proj[mask]))**2)
+
+    res = minimize(objective, [dt_init], method='Nelder-Mead',
+                   options={'maxiter': 500, 'xatol': 1e-8, 'fatol': 1e-8})
+    dt_opt = res.x[0]
+
+    t_start = max(t1.min(), t2.min() + dt_opt)
+    t_end = min(t1.max(), t2.max() + dt_opt)
+    t_10hz = np.arange(t_start, t_end, 0.1)
+
+    f_x1 = interp1d(t1, x1, kind='cubic', fill_value='extrapolate')
+    f_y1 = interp1d(t1, y1, kind='cubic', fill_value='extrapolate')
+
+    x_fuse = (f_x1(t_10hz) + f_x2(t_10hz - dt_opt)) / 2
+    y_fuse = (f_y1(t_10hz) + f_y2(t_10hz - dt_opt)) / 2
+
+    traj = pd.DataFrame({'时间(s)': t_10hz, 'X坐标(m)': x_fuse, 'Y坐标(m)': y_fuse})
+    return dt_opt, traj
+
+# =========================================================================
+# 时空联合对齐
+# =========================================================================
+def align_spatiotemporal(df1, df2, estimate_bias=True):
+    t1, x1, y1 = df1.iloc[:, 0].values, df1.iloc[:, 1].values, df1.iloc[:, 2].values
+    t2, x2, y2 = df2.iloc[:, 0].values, df2.iloc[:, 1].values, df2.iloc[:, 2].values
+
+    f_x2 = interp1d(t2, x2, kind='linear', fill_value='extrapolate')
+    f_y2 = interp1d(t2, y2, kind='linear', fill_value='extrapolate')
+
+    dt_init = estimate_initial_dt(df1, df2)
+
+    def objective(params):
+        dt = params[0]
+        dx = params[1] if estimate_bias else 0.0
+        dy = params[2] if estimate_bias else 0.0
+        t2_proj = t1 - dt
+        mask = (t2_proj >= t2.min()) & (t2_proj <= t2.max())
+        if not np.any(mask):
+            return 1e9
+        pred_x = f_x2(t2_proj[mask]) + dx
+        pred_y = f_y2(t2_proj[mask]) + dy
+        return np.mean((x1[mask] - pred_x)**2 + (y1[mask] - pred_y)**2)
+
+    if estimate_bias:
+        init = [dt_init, np.mean(x1) - np.mean(x2), np.mean(y1) - np.mean(y2)]
+    else:
+        init = [dt_init]
+
+    res = minimize(objective, init, method='Nelder-Mead',
+                   options={'maxiter': 1000, 'xatol': 1e-8, 'fatol': 1e-8})
+
+    if estimate_bias:
+        return res.x[0], res.x[1], res.x[2]
+    return res.x[0], 0.0, 0.0
+
+# =========================================================================
+# 自适应观测噪声估计
 # =========================================================================
 def estimate_measurement_noise(df1, df2, dt, dx, dy):
-    """
-    根据两个传感器时空对齐后的时序残差样本方差，自适应生成卡尔曼滤波的 R 矩阵
-    """
     t1 = df1.iloc[:, 0].values
     t2 = df2.iloc[:, 0].values + dt
 
@@ -57,86 +109,56 @@ def estimate_measurement_noise(df1, df2, dt, dx, dy):
     fy = interp1d(t2, df2.iloc[:, 2].values + dy, fill_value='extrapolate', kind='linear')
 
     mask = (t1 >= t2.min()) & (t1 <= t2.max())
-
     ex = df1.iloc[:, 1].values[mask] - fx(t1[mask])
     ey = df1.iloc[:, 2].values[mask] - fy(t1[mask])
 
-    sigma_x = np.var(ex)
-    sigma_y = np.var(ey)
-
-    # 加入 1e-4 的微小正则化项，防止方差极小时滤波矩阵求逆发生数值奇异
-    return np.diag([max(sigma_x, 1e-4), max(sigma_y, 1e-4)])
+    return np.diag([max(np.var(ex), 1e-4), max(np.var(ey), 1e-4)])
 
 # =========================================================================
-# 核心基础算法：时空偏置联合优化对齐
-# =========================================================================
-def align_spatiotemporal(df1, df2, estimate_bias=True):
-    t1, x1, y1 = df1.iloc[:, 0].values, df1.iloc[:, 1].values, df1.iloc[:, 2].values
-    t2, x2, y2 = df2.iloc[:, 0].values, df2.iloc[:, 1].values, df2.iloc[:, 2].values
-    
-    f_x2 = interp1d(t2, x2, kind='linear', fill_value='extrapolate')
-    f_y2 = interp1d(t2, y2, kind='linear', fill_value='extrapolate')
-    
-    def objective(params):
-        dt = params[0]
-        dx = params[1] if estimate_bias else 0.0
-        dy = params[2] if estimate_bias else 0.0
-        
-        t2_projected = t1 - dt
-        mask = (t2_projected >= t2.min()) & (t2_projected <= t2.max())
-        if not np.any(mask): return 1e9
-        
-        pred_x = f_x2(t2_projected[mask]) + dx
-        pred_y = f_y2(t2_projected[mask]) + dy
-        return np.mean((x1[mask] - pred_x)**2 + (y1[mask] - pred_y)**2)
-    
-    init_guess = [0.0, np.mean(x1)-np.mean(x2), np.mean(y1)-np.mean(y2)] if estimate_bias else [0.0]
-    res = minimize(objective, init_guess, method='Nelder-Mead')
-    
-    if estimate_bias:
-        return res.x[0], res.x[1], res.x[2]
-    return res.x[0], 0.0, 0.0
-
-# =========================================================================
-# 核心基础算法：异步多速率扩展卡尔曼滤波（状态估计器）
+# 异步多速率扩展卡尔曼滤波（6维状态：[x, y, vx, vy, ax, ay]）
 # =========================================================================
 def asynchronous_kalman_filter(df1, df2, dt_opt, dx_opt, dy_opt, R1, R2):
     df2_aligned = df2.copy()
     df2_aligned.iloc[:, 0] += dt_opt
     df2_aligned.iloc[:, 1] += dx_opt
     df2_aligned.iloc[:, 2] += dy_opt
-    
+
     t_start = max(df1.iloc[:, 0].min(), df2_aligned.iloc[:, 0].min())
     t_end = min(df1.iloc[:, 0].max(), df2_aligned.iloc[:, 0].max())
     t_grid = np.arange(t_start, t_end + 1e-5, 0.1)
-    
+
     events = []
-    for t in t_grid: events.append({'t': t, 'type': 'grid'})
-    for _, row in df1.iterrows(): events.append({'t': row.iloc[0], 'type': 'w1', 'z': row.iloc[1:3].values})
-    for _, row in df2_aligned.iterrows(): events.append({'t': row.iloc[0], 'type': 'w2', 'z': row.iloc[1:3].values})
+    for t in t_grid:
+        events.append({'t': t, 'type': 'grid'})
+    for _, row in df1.iterrows():
+        events.append({'t': row.iloc[0], 'type': 'w1', 'z': row.iloc[1:3].values})
+    for _, row in df2_aligned.iterrows():
+        events.append({'t': row.iloc[0], 'type': 'w2', 'z': row.iloc[1:3].values})
     events.sort(key=lambda e: e['t'])
-    
+
     X = np.array([df1.iloc[0, 1], df1.iloc[0, 2], 0.0, 0.0, 0.0, 0.0])
     P = np.eye(6) * 1.0
     Q_base = np.eye(6) * 0.05
-    H = np.zeros((2, 6)); H[0, 0] = 1; H[1, 1] = 1
-    
+    H = np.zeros((2, 6))
+    H[0, 0] = 1
+    H[1, 1] = 1
+
     current_t = events[0]['t']
     output = []
-    
+
     for event in events:
         t_next = event['t']
-        dt = t_next - current_t
-        
-        if dt > 0:
+        delta_t = t_next - current_t
+
+        if delta_t > 0:
             F = np.eye(6)
-            F[0, 2], F[1, 3] = dt, dt
-            F[0, 4], F[1, 5] = 0.5*dt**2, 0.5*dt**2
-            F[2, 4], F[3, 5] = dt, dt
+            F[0, 2], F[1, 3] = delta_t, delta_t
+            F[0, 4], F[1, 5] = 0.5 * delta_t**2, 0.5 * delta_t**2
+            F[2, 4], F[3, 5] = delta_t, delta_t
             X = F @ X
-            P = F @ P @ F.T + Q_base * dt
+            P = F @ P @ F.T + Q_base * delta_t
             current_t = t_next
-            
+
         if event['type'] in ['w1', 'w2']:
             R = R1 if event['type'] == 'w1' else R2
             Y = event['z'] - H @ X
@@ -147,84 +169,74 @@ def asynchronous_kalman_filter(df1, df2, dt_opt, dx_opt, dy_opt, R1, R2):
         elif event['type'] == 'grid':
             output.append({
                 '时间(s)': t_next, 'X坐标(m)': X[0], 'Y坐标(m)': X[1],
-                'Vx(m/s)': X[2], 'Vy(m/s)': X[3], 'Ax(m/s^2)': X[4], 'Ay(m/s^2)': X[5]
+                'Vx(m/s)': X[2], 'Vy(m/s)': X[3],
+                'Ax(m/s^2)': X[4], 'Ay(m/s^2)': X[5]
             })
-            
+
     res_df = pd.DataFrame(output).drop_duplicates(subset=['时间(s)'], keep='last')
     return res_df
 
 # =========================================================================
-# 各问题独立求解入口函数
+# 问题2：含随机噪声+固定系统偏差
 # =========================================================================
-def solve_problem_1(df1, df2):
-    t1, x1, y1 = df1.iloc[:, 0].values, df1.iloc[:, 1].values, df1.iloc[:, 2].values
-    t2, x2, y2 = df2.iloc[:, 0].values, df2.iloc[:, 1].values, df2.iloc[:, 2].values
-    f_x2 = interp1d(t2, x2, kind='cubic', fill_value='extrapolate')
-    f_y2 = interp1d(t2, y2, kind='cubic', fill_value='extrapolate')
-    
-    def objective(dt):
-        t2_projected = t1 - dt
-        mask = (t2_projected >= t2.min()) & (t2_projected <= t2.max())
-        if not np.any(mask): return 1e9
-        return np.mean((x1[mask] - f_x2(t2_projected[mask]))**2 + (y1[mask] - f_y2(t2_projected[mask]))**2)
-    
-    res = minimize(objective, [0.0], method='Nelder-Mead')
-    dt_opt = res.x[0]
-    
-    t_start = max(t1.min(), t2.min() + dt_opt)
-    t_end = min(t1.max(), t2.max() + dt_opt)
-    t_10hz = np.arange(t_start, t_end, 0.1)
-    
-    f_x1 = interp1d(t1, x1, kind='cubic', fill_value='extrapolate')
-    f_y1 = interp1d(t1, y1, kind='cubic', fill_value='extrapolate')
-    
-    x_fuse = (
-    f_x1(t_10hz)
-    +
-    f_x2(t_10hz - dt_opt)
-)/2
-
-    y_fuse = (
-    f_y1(t_10hz)
-    +
-    f_y2(t_10hz - dt_opt)
-)/2
-    traj_10hz = pd.DataFrame({
-    '时间(s)': t_10hz,
-    'X坐标(m)': x_fuse,
-    'Y坐标(m)': y_fuse
-})
-    return dt_opt, traj_10hz
-
 def solve_problem_2(df1, df2):
     dt, dx, dy = align_spatiotemporal(df1, df2, estimate_bias=True)
-    # 升级处二应用：自适应估计 R 矩阵
     R1 = estimate_measurement_noise(df1, df2, dt, dx, dy)
     R2 = R1.copy()
-    traj_10hz = asynchronous_kalman_filter(df1, df2, dt, dx, dy, R1, R2)
-    return dt, dx, dy, traj_10hz
-
-def solve_problem_3(df1, df2):
-    dt_opt, dx_opt, dy_opt = align_spatiotemporal(df1, df2, estimate_bias=True)
-    
-    # 升级处一应用：使用单样本 t 检验进行系统偏置显著性判定
-    px, py = bias_significance_test(df1, df2, dt_opt, dx_opt, dy_opt)
-    
-    print(f"[问题3统计检验] X方向偏置 p值: {px:.5f}, Y方向偏置 p值: {py:.5f}")
-    if px < 0.05 or py < 0.05:
-        print(">>> 结论：拒绝原假设，存在显著的空间系统偏差。")
-    else:
-        print(">>> 结论：接受原假设，空间系统偏差不显著，重置 dx=0, dy=0。")
-        dx_opt, dy_opt = 0.0, 0.0
-        
-    # 升级处二应用：自适应估计 R 矩阵
-    R1 = estimate_measurement_noise(df1, df2, dt_opt, dx_opt, dy_opt)
-    R2 = R1.copy()
-    traj_10hz = asynchronous_kalman_filter(df1, df2, dt_opt, dx_opt, dy_opt, R1, R2)
-    return dt_opt, dx_opt, dy_opt, traj_10hz
+    traj = asynchronous_kalman_filter(df1, df2, dt, dx, dy, R1, R2)
+    return dt, dx, dy, traj
 
 # =========================================================================
-# 升级处三：问题4 任务排程模型的整数线性规划（ILP）求解器
+# 问题3：先纯时间对齐 → t检验 → 再决定是否引入空间偏差
+# =========================================================================
+def solve_problem_3(df1, df2):
+    # Step 1: 仅做时间对齐
+    dt_only, _, _ = align_spatiotemporal(df1, df2, estimate_bias=False)
+    print(f"  [Step1] 纯时间对齐结果: dt = {dt_only:.4f}s")
+
+    # Step 2: 计算空间残差
+    t1 = df1.iloc[:, 0].values
+    x1, y1 = df1.iloc[:, 1].values, df1.iloc[:, 2].values
+    t2_raw = df2.iloc[:, 0].values
+    x2_raw, y2_raw = df2.iloc[:, 1].values, df2.iloc[:, 2].values
+
+    t2_aligned = t2_raw + dt_only
+    f_x2 = interp1d(t2_aligned, x2_raw, kind='linear', fill_value='extrapolate')
+    f_y2 = interp1d(t2_aligned, y2_raw, kind='linear', fill_value='extrapolate')
+
+    mask = (t1 >= t2_aligned.min()) & (t1 <= t2_aligned.max())
+    n_overlap = np.sum(mask)
+    print(f"  [Step2] 重叠样本数: {n_overlap}")
+
+    if n_overlap < 10:
+        print("  ⚠ 样本过少，强制设为有系统偏差模式")
+        dt_opt, dx_opt, dy_opt = align_spatiotemporal(df1, df2, estimate_bias=True)
+    else:
+        dx_residual = x1[mask] - f_x2(t1[mask])
+        dy_residual = y1[mask] - f_y2(t1[mask])
+
+        # Step 3: 双尾t检验
+        px = ttest_1samp(dx_residual, 0).pvalue
+        py = ttest_1samp(dy_residual, 0).pvalue
+        print(f"  [Step3] X方向 p={px:.5f}, 均值={np.mean(dx_residual):.4f}m, std={np.std(dx_residual):.4f}m")
+        print(f"          Y方向 p={py:.5f}, 均值={np.mean(dy_residual):.4f}m, std={np.std(dy_residual):.4f}m")
+
+        alpha = 0.05
+        if px < alpha or py < alpha:
+            print(f"  [Step4] 存在显著系统偏差 (p<{alpha})，联合对齐...")
+            dt_opt, dx_opt, dy_opt = align_spatiotemporal(df1, df2, estimate_bias=True)
+        else:
+            print(f"  [Step4] 系统偏差不显著，dx=0, dy=0")
+            dt_opt, dx_opt, dy_opt = dt_only, 0.0, 0.0
+
+    # Step 5: 卡尔曼滤波
+    R1 = estimate_measurement_noise(df1, df2, dt_opt, dx_opt, dy_opt)
+    R2 = R1.copy()
+    traj = asynchronous_kalman_filter(df1, df2, dt_opt, dx_opt, dy_opt, R1, R2)
+    return dt_opt, dx_opt, dy_opt, traj
+
+# =========================================================================
+# 问题4：任务排程 ILP 优化
 # =========================================================================
 def solve_problem_4(trajectory_df, df_shoot, df_photo):
     t = trajectory_df['时间(s)'].values
@@ -232,157 +244,164 @@ def solve_problem_4(trajectory_df, df_shoot, df_photo):
     y = trajectory_df['Y坐标(m)'].values
     v = np.sqrt(trajectory_df['Vx(m/s)'].values**2 + trajectory_df['Vy(m/s)'].values**2)
     a = np.sqrt(trajectory_df['Ax(m/s^2)'].values**2 + trajectory_df['Ay(m/s^2)'].values**2)
-    
+
+    SHOOT_STEPS = 15   # 1.5s @ 10Hz
+    PHOTO_STEPS = 5    # 0.5s @ 10Hz
+
     candidate_windows = []
-    
-    # 1. 扫描生成所有符合运动学边界的候选射击窗口
+
+    # 射击候选窗口
     for _, target in df_shoot.iterrows():
         tid, tx, ty = target['编号'], target['X坐标(m)'], target['Y坐标(m)']
         dists = np.sqrt((x - tx)**2 + (y - ty)**2)
-        valid_instant = (dists >= 5) & (dists <= 30) & (v <= 2.0) & (a <= 1.5)
-        
-        for i in range(len(t) - 15):
-            if np.all(valid_instant[i:i+16]):
+        valid = (dists >= 5) & (dists <= 30) & (v <= 2.0) & (a <= 1.5)
+        for i in range(len(t) - SHOOT_STEPS):
+            if np.all(valid[i:i + SHOOT_STEPS + 1]):
+                exec_t = t[i + SHOOT_STEPS]
+                angle = np.arctan2(ty - y[i + SHOOT_STEPS], tx - x[i + SHOOT_STEPS]) * 180 / np.pi
                 candidate_windows.append({
                     'target_id': tid, 'type': '射击',
-                    'start_t': t[i], 'end_t': t[i+15],
-                    'angle': np.arctan2(ty - y[i+15], tx - x[i+15]) * 180 / np.pi
+                    'start_t': t[i], 'end_t': exec_t, 'angle': angle
                 })
-                
-    # 2. 扫描生成所有符合运动学边界的候选拍照窗口
+
+    # 拍照候选窗口
     for _, target in df_photo.iterrows():
         tid, tx, ty = target['编号'], target['X坐标(m)'], target['Y坐标(m)']
         dists = np.sqrt((x - tx)**2 + (y - ty)**2)
-        valid_instant = (dists >= 10) & (dists <= 40) & (v <= 1.5) & (a <= 1.5)
-        
-        for i in range(len(t) - 5):
-            if np.all(valid_instant[i:i+6]):
+        valid = (dists >= 10) & (dists <= 40) & (v <= 1.5) & (a <= 1.5)
+        for i in range(len(t) - PHOTO_STEPS):
+            if np.all(valid[i:i + PHOTO_STEPS + 1]):
+                exec_t = t[i + PHOTO_STEPS]
+                angle = np.arctan2(ty - y[i + PHOTO_STEPS], tx - x[i + PHOTO_STEPS]) * 180 / np.pi
                 candidate_windows.append({
                     'target_id': tid, 'type': '拍照',
-                    'start_t': t[i], 'end_t': t[i+5],
-                    'angle': np.arctan2(ty - y[i+5], tx - x[i+5]) * 180 / np.pi
+                    'start_t': t[i], 'end_t': exec_t, 'angle': angle
                 })
-                
+
     if not candidate_windows:
-        print("未找到任何可行任务窗口！")
+        print("⚠ 未找到任何可行任务窗口！")
         return pd.DataFrame()
 
-    # 3. 创建 PuLP 整数线性规划模型
+    print(f"  共生成 {len(candidate_windows)} 个候选窗口")
+
+    # ILP
     prob = LpProblem("Robot_Task_Optimization", LpMaximize)
-    
-    # 定义 0-1 二进制决策变量
-    x_vars = {i: LpVariable(f"x_{i}", cat='Binary') for i in range(len(candidate_windows))}
-    
-    # 建立目标函数：最大化加权收益
-    objective = []
+    N = len(candidate_windows)
+    x_var = {i: LpVariable(f"x_{i}", cat='Binary') for i in range(N)}
+
+    prob += lpSum([(0.85 if candidate_windows[i]['type'] == '射击' else 1.0) * x_var[i]
+                   for i in range(N)])
+
+    # 时间冲突约束
+    all_times = sorted(set([w['start_t'] for w in candidate_windows] +
+                           [w['end_t'] for w in candidate_windows]))
+    for k in range(len(all_times) - 1):
+        t_mid = (all_times[k] + all_times[k + 1]) / 2
+        active = [i for i, w in enumerate(candidate_windows)
+                  if w['start_t'] <= t_mid <= w['end_t']]
+        if len(active) > 1:
+            prob += lpSum([x_var[i] for i in active]) <= 1
+
+    # 拍照角度差异约束
+    photo_by_target = {}
     for i, w in enumerate(candidate_windows):
-        weight = 0.85 if w["type"] == "射击" else 1.0
-        objective.append(weight * x_vars[i])
-    prob += lpSum(objective)
-    
-    # 建立时间排程冲突约束（采用极其高效的扫描线区间互斥算法，防止大样本下卡死）
-    time_events = []
-    for i, w in enumerate(candidate_windows):
-        time_events.append((w['start_t'], 1, i))   # 1 代表窗口开启
-        time_events.append((w['end_t'], -1, i))    # -1 代表窗口关闭
-    # 按照时间节点排序（若时间戳相同，关闭事件优先，避免零交集误判）
-    time_events.sort(key=lambda ev: (ev[0], ev[1]))
-    
-    active_windows = set()
-    for t_val, event_type, idx in time_events:
-        if event_type == 1:
-            active_windows.add(idx)
-            # 如果当前重叠时间区间内的活跃任务大于1，添加联合互斥约束：这些任务之和最多为1
-            if len(active_windows) > 1:
-                prob += lpSum([x_vars[k] for k in active_windows]) <= 1
-        else:
-            if idx in active_windows:
-                active_windows.remove(idx)
-                
-    # 4. 拍照夹角约束
-    # =========================================================================
-    # 【高能优化】：用时间点切片法取代原有的 O(N^2) 两两暴力循环，防止约束爆炸
-    # =========================================================================
-    # 1. 提取所有动作视窗的起止关键时间点并去重排序
-    all_times = [w['start_t'] for w in candidate_windows] + [w['end_t'] for w in candidate_windows]
-    time_points = sorted(list(set(all_times)))
-    
-    # 2. 遍历每一个相邻时间段，确保每个时间片段内最多只有一个任务被激活
-    for k in range(len(time_points) - 1):
-        t_start_cell = time_points[k]
-        t_end_cell = time_points[k+1]
-        t_mid = (t_start_cell + t_end_cell) / 2.0  # 取时间片中点判定覆盖性
-        
-        # 找出所有包含当前时间片的候选窗口索引
-        active_windows = [
-            i for i, w in enumerate(candidate_windows) 
-            if w['start_t'] <= t_mid <= w['end_t']
-        ]
-        
-        # 核心硬约束：这些重叠的窗口变量之和不能超过 1
-        if len(active_windows) > 1:
-            prob += (lpSum([x_vars[i] for i in active_windows]) <= 1)
-                    
-    # 5. 调用 CBC 求解器精确求解
+        if w['type'] == '拍照':
+            photo_by_target.setdefault(w['target_id'], []).append(i)
+
+    angle_cnstr = 0
+    for tid, indices in photo_by_target.items():
+        for a in range(len(indices)):
+            for b in range(a + 1, len(indices)):
+                i, j = indices[a], indices[b]
+                diff = calculate_angle_diff(candidate_windows[i]['angle'],
+                                            candidate_windows[j]['angle'])
+                if diff < PHOTO_ANGLE_MIN_DIFF:
+                    prob += x_var[i] + x_var[j] <= 1
+                    angle_cnstr += 1
+    print(f"  角度差异约束（<{PHOTO_ANGLE_MIN_DIFF}°）: {angle_cnstr} 条")
+
     prob.solve(PULP_CBC_CMD(msg=False))
-    
-    # 6. 过滤输出最优决策结果
+    print(f"  求解状态: {LpStatus[prob.status]}")
+
     selected = []
-    for i in x_vars:
-        if value(x_vars[i]) > 0.5:
+    for i in range(N):
+        if pulp.value(x_var[i]) > 0.5:
             selected.append(candidate_windows[i])
-            
+    selected.sort(key=lambda w: w['start_t'])
     return pd.DataFrame(selected)
 
 # =========================================================================
-# 主程序执行流（自动读取附件并依序完成所有建模求解）
+# 输出 result.xlsx
+# =========================================================================
+def write_result_xlsx(schedule_df, template_path, output_path):
+    from openpyxl import load_workbook
+    wb = load_workbook(template_path)
+    ws = wb.active
+    start_row = 4
+    for idx, (_, row_data) in enumerate(schedule_df.iterrows()):
+        r = start_row + idx
+        ws.cell(row=r, column=1, value=idx + 1)
+        ws.cell(row=r, column=2, value=row_data['target_id'])
+        ws.cell(row=r, column=3, value=row_data['type'])
+        ws.cell(row=r, column=4, value=round(row_data['start_t'], 2))
+        ws.cell(row=r, column=5, value=round(row_data['end_t'], 2))
+    wb.save(output_path)
+    print(f"✅ 结果已写入: {output_path}")
+
+# =========================================================================
+# 主程序
 # =========================================================================
 if __name__ == '__main__':
-    
-    print("====== 正在加载多源传感器定位与任务数据 ======")
-    # 问题 1 读入对应的两个不同频率的 Sheet
-    f1_p1 = pd.read_excel('/home/lsp/Mathematical_schrace/data/附件1.xlsx', sheet_name='方式1(4Hz)')
-    f2_p1 = pd.read_excel('/home/lsp/Mathematical_schrace/data/附件1.xlsx', sheet_name='方式2(5Hz)')
-    
-    # 问题 2 读入对应的两个不同频率的 Sheet
-    f1_p2 = pd.read_excel('/home/lsp/Mathematical_schrace/data/附件2.xlsx', sheet_name='方式1(4Hz)')
-    f2_p2 = pd.read_excel('/home/lsp/Mathematical_schrace/data/附件2.xlsx', sheet_name='方式2(5Hz)')
-    
-    # 问题 3 读入对应的两个不同频率的 Sheet
-    f1_p3 = pd.read_excel('/home/lsp/Mathematical_schrace/data/附件3.xlsx', sheet_name='方式1(4Hz)')
-    f2_p3 = pd.read_excel('/home/lsp/Mathematical_schrace/data/附件3.xlsx', sheet_name='方式2(5Hz)')
-    
-    # 问题 4 读入两个不同的目标 Sheet
-    df_shoot = pd.read_excel('/home/lsp/Mathematical_schrace/data/附件4.xlsx', sheet_name='射击目标')
-    df_photo = pd.read_excel('/home/lsp/Mathematical_schrace/data/附件4.xlsx', sheet_name='拍照目标')
-    
-    print("\n====== [开始求解问题 1] ======")
+    DATA = DATA_DIR
+    print("=" * 60)
+    print("  多源融合机器人定位及任务优化")
+    print("=" * 60)
+
+    print("\n📂 加载数据...")
+    f1_p1 = pd.read_excel(DATA + '附件1.xlsx', sheet_name='方式1(4Hz)')
+    f2_p1 = pd.read_excel(DATA + '附件1.xlsx', sheet_name='方式2(5Hz)')
+    f1_p2 = pd.read_excel(DATA + '附件2.xlsx', sheet_name='方式1(4Hz)')
+    f2_p2 = pd.read_excel(DATA + '附件2.xlsx', sheet_name='方式2(5Hz)')
+    f1_p3 = pd.read_excel(DATA + '附件3.xlsx', sheet_name='方式1(4Hz)')
+    f2_p3 = pd.read_excel(DATA + '附件3.xlsx', sheet_name='方式2(5Hz)')
+    df_shoot = pd.read_excel(DATA + '附件4.xlsx', sheet_name='射击目标')
+    df_photo = pd.read_excel(DATA + '附件4.xlsx', sheet_name='拍照目标')
+
+    # 问题1
+    print("\n" + "=" * 40)
+    print("[问题1] 无噪声，仅时间对齐")
     dt1, traj1 = solve_problem_1(f1_p1, f2_p1)
-    print(f"问题1结果 -> 时间偏差 dt: {dt1:.4f}s")
-    traj1.to_csv('问题1_10Hz轨迹结果.csv', index=False)
-    
-    print("\n====== [开始求解问题 2] ======")
+    print(f"  时间偏差 dt = {dt1:.4f}s, 10Hz轨迹: {len(traj1)}点")
+    traj1.to_csv(DATA + '问题1_10Hz轨迹结果.csv', index=False)
+
+    # 问题2
+    print("\n" + "=" * 40)
+    print("[问题2] 含随机噪声+固定系统偏差")
     dt2, dx2, dy2, traj2 = solve_problem_2(f1_p2, f2_p2)
-    print(f"问题2结果 -> 时间偏差 dt: {dt2:.4f}s, X偏置 dx: {dx2:.4f}m, Y偏置 dy: {dy2:.4f}m")
-    traj2.to_csv('问题2_10Hz轨迹结果.csv', index=False)
-    
-    print("\n====== [开始求解问题 3] ======")
+    print(f"  dt = {dt2:.4f}s, dx = {dx2:.4f}m, dy = {dy2:.4f}m, 轨迹: {len(traj2)}点")
+    traj2.to_csv(DATA + '问题2_10Hz轨迹结果.csv', index=False)
+
+    # 问题3
+    print("\n" + "=" * 40)
+    print("[问题3] 实际数据，判断系统偏差 → 对齐融合")
     dt3, dx3, dy3, traj3 = solve_problem_3(f1_p3, f2_p3)
-    print(f"问题3结果 -> 时间偏差 dt: {dt3:.4f}s, 最终有效 dx: {dx3:.4f}m, dy: {dy3:.4f}m")
-    traj3.to_csv('问题3_10Hz轨迹结果.csv', index=False)
-    
-    print("\n====== [开始求解问题 4] ======")
-    schedule_res = solve_problem_4(traj3, df_shoot, df_photo)
-    print(f"问题4规划完成！成功排程执行的任务总数: {len(schedule_res)} 个")
-    
-    if not schedule_res.empty:
-        # 转换成赛题标准格式
-        final_report = pd.DataFrame()
-        final_report['序号'] = range(1, len(schedule_res) + 1)
-        final_report['目标编号'] = schedule_res['target_id']
-        final_report['任务'] = schedule_res['type']
-        final_report['开始准备时刻(s)'] = schedule_res['start_t']
-        final_report['任务执行时刻(s)'] = schedule_res['end_t'] # 刚好是准备结束、执行动作的时刻
-        
-        print(final_report.head(10))
-        final_report.to_csv('问题4_任务排程最优决策表.csv', index=False, encoding='utf-8-sig')
+    print(f"  最终: dt = {dt3:.4f}s, dx = {dx3:.4f}m, dy = {dy3:.4f}m, 轨迹: {len(traj3)}点")
+    traj3.to_csv(DATA + '问题3_10Hz轨迹结果.csv', index=False)
+
+    # 问题4
+    print("\n" + "=" * 40)
+    print("[问题4] 任务排程优化")
+    schedule_df = solve_problem_4(traj3, df_shoot, df_photo)
+
+    if not schedule_df.empty:
+        s_cnt = (schedule_df['type'] == '射击').sum()
+        p_cnt = (schedule_df['type'] == '拍照').sum()
+        print(f"  射击: {s_cnt}, 拍照: {p_cnt}, 总计: {len(schedule_df)}")
+        print(schedule_df[['target_id', 'type', 'start_t', 'end_t', 'angle']].head(20).to_string())
+        write_result_xlsx(schedule_df, DATA + 'result.xlsx', DATA + 'result.xlsx')
+    else:
+        print("  ⚠ 无可行排程结果！")
+
+    print("\n" + "=" * 60)
+    print("  全部求解完成！")
+    print("=" * 60)
